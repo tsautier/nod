@@ -120,7 +120,9 @@ where
             }
             drop(block_tx); // Disconnect channel
 
-            let (result_tx, result_rx) = crossbeam_channel::bounded(0);
+            // Buffer up to one result per worker, allowing processing to continue while the
+            // main thread reorders and writes completed blocks.
+            let (result_tx, result_rx) = crossbeam_channel::bounded(num_threads);
 
             // Spawn threads to process blocks
             for _ in 0..num_threads - 1 {
