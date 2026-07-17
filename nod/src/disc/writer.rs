@@ -247,6 +247,12 @@ pub(crate) fn check_block(
         let partition_start = partition.data_start_sector as u64 * SECTOR_SIZE as u64;
         let partition_offset =
             ((input_position - partition_start) / SECTOR_SIZE as u64) * SECTOR_DATA_SIZE as u64;
+        // Junk data within a partition is seeded from the partition's own disc header, which is
+        // also what junk regeneration uses at read time. It usually matches the outer disc
+        // header, but nothing guarantees that.
+        let partition_header = partition.disc_header();
+        let disc_id = *array_ref![partition_header.game_id, 0, 4];
+        let disc_num = partition_header.disc_num;
         if sector_data_iter(block).enumerate().all(|(i, sector_data)| {
             let sector_offset = partition_offset + i as u64 * SECTOR_DATA_SIZE as u64;
             lfg.check_sector_chunked(sector_data, disc_id, disc_num, sector_offset)
@@ -268,4 +274,80 @@ pub(crate) fn check_block(
 #[inline]
 fn sector_data_iter(buf: &[u8]) -> impl Iterator<Item = &[u8; SECTOR_DATA_SIZE]> {
     buf.chunks_exact(SECTOR_SIZE).map(|chunk| (&chunk[HASHES_SIZE..]).try_into().unwrap())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use zerocopy::FromZeros;
+
+    use super::*;
+    use crate::{
+        common::PartitionKind,
+        disc::{BOOT_SIZE, wii::WiiPartitionHeader},
+        util::lfg::LaggedFibonacci,
+    };
+
+    const PARTITION_ID: [u8; 4] = *b"GKQJ";
+    const OUTER_ID: [u8; 4] = *b"GKQE";
+
+    fn partition_info() -> PartitionInfo {
+        let mut raw_boot = [0u8; BOOT_SIZE];
+        raw_boot[..4].copy_from_slice(&PARTITION_ID);
+        raw_boot[4..6].copy_from_slice(b"01");
+        PartitionInfo {
+            index: 0,
+            kind: PartitionKind::Data,
+            start_sector: 0,
+            data_start_sector: 0,
+            data_end_sector: 16,
+            key: [0u8; 16],
+            header: Arc::new(WiiPartitionHeader::new_zeroed()),
+            has_encryption: false,
+            has_hashes: true,
+            raw_boot: Arc::new(raw_boot),
+            raw_fst: None,
+        }
+    }
+
+    fn junk_sector(disc_id: [u8; 4]) -> Vec<u8> {
+        let mut buf = vec![0u8; SECTOR_SIZE];
+        let mut lfg = LaggedFibonacci::default();
+        lfg.fill_sector_chunked(&mut buf[HASHES_SIZE..], disc_id, 0, 0);
+        buf
+    }
+
+    fn run_check_block(buf: &[u8], partition: &PartitionInfo) -> CheckBlockResult {
+        let mut decrypted = vec![0u8; buf.len()];
+        check_block(
+            buf,
+            &mut decrypted,
+            0,
+            std::slice::from_ref(partition),
+            &mut LaggedFibonacci::default(),
+            OUTER_ID,
+            0,
+            false,
+        )
+        .unwrap()
+    }
+
+    /// Junk inside a partition is seeded from the partition's own disc header, which may differ
+    /// from the outer disc header (and is what read-time regeneration uses).
+    #[test]
+    fn check_block_seeds_partition_junk_from_partition_header() {
+        let partition = partition_info();
+        let result = run_check_block(&junk_sector(PARTITION_ID), &partition);
+        assert!(matches!(result, CheckBlockResult::Junk));
+    }
+
+    /// Junk generated from the outer disc header's ID must NOT be detected inside a partition
+    /// with a different ID: read-time regeneration would produce different bytes.
+    #[test]
+    fn check_block_rejects_outer_header_junk_in_partition() {
+        let partition = partition_info();
+        let result = run_check_block(&junk_sector(OUTER_ID), &partition);
+        assert!(matches!(result, CheckBlockResult::Normal));
+    }
 }

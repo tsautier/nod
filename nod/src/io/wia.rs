@@ -1083,6 +1083,17 @@ struct BlockMetaWIA {
     data_hash: u64,
 }
 
+/// How the LFG seed for a packed junk area is obtained.
+enum JunkSeed {
+    /// All-zero data, packed as an all-zeroes seed.
+    Zeroed,
+    /// Standard junk: seed derived from the disc ID, disc number, and sector.
+    Sector(u32),
+    /// Seed recovered from the junk data itself (e.g. when the disc header's game ID no longer
+    /// matches the ID the junk was generated from).
+    Recovered([u32; SEED_SIZE]),
+}
+
 #[derive(Clone)]
 struct JunkInfo {
     start_sector: u32,
@@ -1298,7 +1309,7 @@ impl BlockProcessorWIA {
                     // will likely handle this better.
                     if self.compressor.kind == Compression::None && zeroes > SEED_SIZE_BYTES + 4 {
                         debug!("Packing {} zero bytes in group {}", zeroes, info.index);
-                        junk_areas.push((data_offset, u32::MAX, zeroes));
+                        junk_areas.push((data_offset, JunkSeed::Zeroed, zeroes));
                     }
 
                     offset += zeroes as u64;
@@ -1317,9 +1328,25 @@ impl BlockProcessorWIA {
                 .count();
             if num_match > SEED_SIZE_BYTES + 4 {
                 debug!("Matched {} junk bytes at offset {:#X}", num_match, offset);
-                junk_areas.push((data_offset, sector, num_match));
+                junk_areas.push((data_offset, JunkSeed::Sector(sector), num_match));
                 offset += num_match as u64;
                 data_offset += num_match;
+            } else {
+                // The disc-ID-derived seed didn't match (e.g. the game ID was modified by a
+                // patch after the junk was generated). Try to recover the seed from the data
+                // itself, like Dolphin does.
+                let mut seed = [0u32; SEED_SIZE];
+                let num_match = self.lfg.recover_seed(
+                    &data[data_offset..data_offset + len],
+                    sector_offset,
+                    &mut seed,
+                );
+                if num_match > SEED_SIZE_BYTES + 4 {
+                    debug!("Recovered junk seed for {} bytes at offset {:#X}", num_match, offset);
+                    junk_areas.push((data_offset, JunkSeed::Recovered(seed), num_match));
+                    offset += num_match as u64;
+                    data_offset += num_match;
+                }
             }
 
             if offset < sector_end {
@@ -1355,18 +1382,26 @@ impl BlockProcessorWIA {
             out: &mut [u8],
             offset: usize,
             len: usize,
-            sector: u32,
+            seed: &JunkSeed,
             junk_info: &JunkInfo,
         ) {
             let mut seed_out = [0u32; SEED_SIZE];
-            // We use u32::MAX as a marker for zeroed data (LFG seed all zeroes)
-            if sector != u32::MAX {
-                LaggedFibonacci::generate_seed_be(
-                    &mut seed_out,
-                    junk_info.disc_id,
-                    junk_info.disc_num,
-                    sector,
-                );
+            match seed {
+                // Zeroed data is packed as an all-zeroes LFG seed
+                JunkSeed::Zeroed => {}
+                JunkSeed::Sector(sector) => {
+                    LaggedFibonacci::generate_seed_be(
+                        &mut seed_out,
+                        junk_info.disc_id,
+                        junk_info.disc_num,
+                        *sector,
+                    );
+                }
+                JunkSeed::Recovered(seed) => {
+                    for (out, x) in seed_out.iter_mut().zip(seed) {
+                        *out = x.to_be();
+                    }
+                }
             }
             *array_ref_mut![out, offset, 4] = (len as u32 | COMPRESSED_BIT).to_be_bytes();
             array_ref_mut![out, offset + 4, SEED_SIZE_BYTES].copy_from_slice(seed_out.as_bytes());
@@ -1388,7 +1423,8 @@ impl BlockProcessorWIA {
             let mut packed_data = BytesMut::zeroed(packed_data_len);
             let mut packed_data_offset = 0;
             last_data_offset = 0;
-            for &(data_offset, sector, len) in &junk_areas {
+            for (data_offset, seed, len) in &junk_areas {
+                let (data_offset, len) = (*data_offset, *len);
                 if data_offset > last_data_offset {
                     let len = data_offset - last_data_offset;
                     write_raw_data(
@@ -1400,7 +1436,7 @@ impl BlockProcessorWIA {
                     );
                     packed_data_offset += 4 + len;
                 }
-                write_junk_data(packed_data.as_mut(), packed_data_offset, len, sector, junk_info);
+                write_junk_data(packed_data.as_mut(), packed_data_offset, len, seed, junk_info);
                 packed_data_offset += 4 + SEED_SIZE_BYTES;
                 last_data_offset = data_offset + len;
             }

@@ -147,6 +147,137 @@ impl LaggedFibonacci {
         }
     }
 
+    /// Reverses the LFG by one step. Exact inverse of [`Self::forward`].
+    #[inline(never)]
+    fn backward(&mut self) {
+        for i in (LFG_J..LFG_K).rev() {
+            self.buffer[i] ^= self.buffer[i - LFG_J];
+        }
+        for i in (0..LFG_J).rev() {
+            self.buffer[i] ^= self.buffer[i + LFG_K - LFG_J];
+        }
+    }
+
+    /// Reverses the LFG by one step, only for words in `start_word..end_word`.
+    fn backward_range(&mut self, start_word: usize, end_word: usize) {
+        let loop_end = LFG_J.max(start_word);
+        let mut i = end_word.min(LFG_K);
+        while i > loop_end {
+            i -= 1;
+            self.buffer[i] ^= self.buffer[i - LFG_J];
+        }
+        let mut i = end_word.min(LFG_J);
+        while i > start_word {
+            i -= 1;
+            self.buffer[i] ^= self.buffer[i + LFG_K - LFG_J];
+        }
+    }
+
+    /// Same as [`Self::init`], but verifies that the expanded state is consistent with the
+    /// existing buffer contents (which were reconstructed from junk data). Returns false if the
+    /// buffer could not have been produced by any seed.
+    fn init_check_existing(&mut self) -> bool {
+        for i in SEED_SIZE..LFG_K {
+            let calculated = (self.buffer[i - SEED_SIZE] << 23)
+                ^ (self.buffer[i - SEED_SIZE + 1] >> 9)
+                ^ self.buffer[i - 1];
+            // Bits 16-17 of each word are not recoverable from the output data, so they're
+            // excluded from the comparison.
+            let actual = (self.buffer[i] & 0xFF00FFFF) | ((self.buffer[i] << 2) & 0x00FC0000);
+            if calculated & 0xFFFCFFFF != actual {
+                return false;
+            }
+            self.buffer[i] = calculated;
+        }
+        for x in self.buffer.iter_mut() {
+            *x = ((*x & 0xFF00FFFF) | ((*x >> 2) & 0x00FF0000)).to_be();
+        }
+        for _ in 0..4 {
+            self.forward();
+        }
+        true
+    }
+
+    /// Reconstructs the seed from a fully-populated output buffer by running the generator
+    /// backward. On success, writes the recovered seed (same domain as [`Self::generate_seed`])
+    /// to `seed_out` and leaves the generator initialized. Returns false if the buffer contents
+    /// are not valid LFG output.
+    fn reinitialize(&mut self, seed_out: &mut [u32; SEED_SIZE]) -> bool {
+        for _ in 0..4 {
+            self.backward();
+        }
+        for x in self.buffer.iter_mut() {
+            *x = u32::from_be(*x);
+        }
+        // Reconstruct the bits which are missing due to the output code shifting by 18 instead
+        // of 16. Bits 16-17 of the first word are not recoverable, but they don't affect the
+        // observable output.
+        for i in 0..SEED_SIZE {
+            self.buffer[i] = (self.buffer[i] & 0xFF00FFFF)
+                | ((self.buffer[i] << 2) & 0x00FC0000)
+                | (((self.buffer[i + 16] ^ self.buffer[i + 15]) << 9) & 0x00030000);
+        }
+        seed_out.copy_from_slice(&self.buffer[..SEED_SIZE]);
+        self.init_check_existing()
+    }
+
+    /// Attempts to recover the LFG seed directly from junk data, without knowing the disc ID it
+    /// was generated from. `data` must start at `stream_offset` bytes into the junk stream (i.e.
+    /// the offset within the sector, since the stream reseeds every sector). Requires at least
+    /// [`LFG_K_BYTES`] (plus up to 3 alignment bytes) of contiguous junk.
+    ///
+    /// On success, writes the recovered seed (same domain as [`Self::generate_seed`]) to
+    /// `seed_out` and returns the number of bytes from the start of `data` the seed reproduces.
+    /// Returns 0 if no seed could be recovered.
+    ///
+    /// Reference: `LaggedFibonacciGenerator::GetSeed` in Dolphin (CC0-1.0).
+    #[instrument(name = "LaggedFibonacci::recover_seed", skip_all)]
+    pub fn recover_seed(
+        &mut self,
+        data: &[u8],
+        stream_offset: usize,
+        seed_out: &mut [u32; SEED_SIZE],
+    ) -> usize {
+        // Only whole u32 words (relative to the junk stream) are used to regenerate the seed.
+        let bytes_to_skip = stream_offset.next_multiple_of(4) - stream_offset;
+        if data.len() < bytes_to_skip + LFG_K_BYTES {
+            return 0;
+        }
+        let word_offset = (stream_offset + bytes_to_skip) / 4;
+        let word_offset_mod_k = word_offset % LFG_K;
+        let word_offset_div_k = word_offset / LFG_K;
+
+        for (i, chunk) in
+            data[bytes_to_skip..bytes_to_skip + LFG_K_BYTES].chunks_exact(4).enumerate()
+        {
+            let word = u32::from_be_bytes(chunk.try_into().unwrap());
+            // If the data doesn't look like something we can regenerate, return early.
+            if word & 0x00C00000 != (word >> 2) & 0x00C00000 {
+                return 0;
+            }
+            self.buffer[(word_offset_mod_k + i) % LFG_K] = word.to_be();
+        }
+
+        self.backward_range(0, word_offset_mod_k);
+        for _ in 0..word_offset_div_k {
+            self.backward();
+        }
+        if !self.reinitialize(seed_out) {
+            return 0;
+        }
+
+        // Independently verify with the recovered seed through the same code path readers use,
+        // and count how many bytes it reproduces.
+        self.buffer[..SEED_SIZE].copy_from_slice(seed_out);
+        self.position = 0;
+        self.init();
+        self.skip(stream_offset);
+        let mut lfg_buf = [0u8; SECTOR_SIZE];
+        let len = data.len().min(SECTOR_SIZE - stream_offset);
+        self.fill(&mut lfg_buf[..len]);
+        data[..len].iter().zip(&lfg_buf[..len]).take_while(|(a, b)| a == b).count()
+    }
+
     /// Skips `n` bytes of junk data.
     pub fn skip(&mut self, n: usize) {
         self.position += n;
@@ -343,6 +474,54 @@ mod tests {
             0xA2, 0x0E, 0xDC, 0x0D, 0x59, 0xC0, 0x02, 0x98, 0xA5, 0x00, 0x39, 0x5B, 0x68, 0xA6,
             0x5D, 0x53, 0x2D, 0xB6
         ]);
+    }
+
+    #[test]
+    fn test_recover_seed_aligned() {
+        let mut src = LaggedFibonacci::default();
+        let mut data = vec![0u8; SECTOR_SIZE];
+        src.fill_sector_chunked(&mut data, [0x47, 0x4B, 0x51, 0x4A], 0, 3 * SECTOR_SIZE as u64);
+        let mut seed = [0u32; SEED_SIZE];
+        let mut lfg = LaggedFibonacci::default();
+        let matched = lfg.recover_seed(&data, 0, &mut seed);
+        assert_eq!(matched, SECTOR_SIZE);
+        // The recovered seed must reproduce the junk stream through the reader code path.
+        let mut check = LaggedFibonacci::default();
+        check.buffer[..SEED_SIZE].copy_from_slice(&seed);
+        check.init();
+        let mut buf = vec![0u8; SECTOR_SIZE];
+        check.fill(&mut buf);
+        assert_eq!(buf, data);
+    }
+
+    #[test]
+    fn test_recover_seed_unaligned_offset() {
+        let mut src = LaggedFibonacci::default();
+        let mut sector = vec![0u8; SECTOR_SIZE];
+        src.fill_sector_chunked(&mut sector, [0x52, 0x45, 0x4C, 0x53], 1, 7 * SECTOR_SIZE as u64);
+        let off = 0x1235;
+        let mut seed = [0u32; SEED_SIZE];
+        let mut lfg = LaggedFibonacci::default();
+        let matched = lfg.recover_seed(&sector[off..], off, &mut seed);
+        assert_eq!(matched, SECTOR_SIZE - off);
+    }
+
+    #[test]
+    fn test_recover_seed_rejects_non_junk() {
+        let data = vec![0xA5u8; SECTOR_SIZE];
+        let mut seed = [0u32; SEED_SIZE];
+        let mut lfg = LaggedFibonacci::default();
+        assert_eq!(lfg.recover_seed(&data, 0, &mut seed), 0);
+    }
+
+    #[test]
+    fn test_recover_seed_too_short() {
+        let mut src = LaggedFibonacci::default();
+        let mut data = vec![0u8; LFG_K_BYTES - 4];
+        src.fill_sector_chunked(&mut data, [0x47, 0x4B, 0x51, 0x4A], 0, 0);
+        let mut seed = [0u32; SEED_SIZE];
+        let mut lfg = LaggedFibonacci::default();
+        assert_eq!(lfg.recover_seed(&data, 0, &mut seed), 0);
     }
 
     #[test]
